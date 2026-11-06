@@ -572,6 +572,12 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
     if (!ps) { if (!g_pso_mtk_building) g_pso_mtk_building = [NSObject new]; hm_put_id(&g_pso_mtk, &k, g_pso_mtk_building); }
     os_unfair_lock_unlock(&g_pso_mtk_lock);
     if (ps) return ps == NSNull.null || ps == g_pso_mtk_building ? nil : ps;
+    if (ms->fn.functionType != MTLFunctionTypeMesh || (ts && ts->fn.functionType != MTLFunctionTypeObject)) {
+        MLOG("[RED] task / mesh pipeline: function is not an object / mesh function (task %s type %lu, mesh %s type %lu)",
+             ts ? ts->key : "-", (unsigned long)(ts ? ts->fn.functionType : 0), ms->key, (unsigned long)ms->fn.functionType);
+        os_unfair_lock_lock(&g_pso_mtk_lock); hm_put_id(&g_pso_mtk, &k, NSNull.null); os_unfair_lock_unlock(&g_pso_mtk_lock);
+        return nil;
+    }
     MTLRenderPipelineDescriptor *d = pso_desc(&k, ms, fs, nil, 0);
     MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
     m.meshFunction = ms->fn; m.fragmentFunction = d.fragmentFunction ?: mtk_nop_fragment(); m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
@@ -593,9 +599,9 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
     [en setArgumentTable:g_vt atStages:MTLRenderStageMesh];
     uint64_t first_gpu = g_mtk.ind_first;
     if (!g_mtk.ind) { id<MTLBuffer> b; size_t o = arena_alloc(16, &b); memcpy((uint8_t *)b.contents + o, &g_mtk.first, 4); first_gpu = b.gpuAddress + o; }
-    if (ts) { [en setArgumentTable:g_ot atStages:MTLRenderStageObject]; g_args_dirty[3] = 1; encode_args(en, ts, 3, 0);
+    if (ts) { [en setArgumentTable:g_ot atStages:MTLRenderStageObject]; g_args_dirty[3] = 1; encode_args(en, ts, 3, 0); if (g_enc != en) return;
               if (rec_on()) rec_table_op(RO_T_ADDR, g_ot, first_gpu, DMSH_MESH_FIRST_SLOT); else [g_ot setAddress:first_gpu atIndex:DMSH_MESH_FIRST_SLOT]; }
-    g_args_dirty[4] = 1; encode_args(en, ms, 4, 1);
+    g_args_dirty[4] = 1; encode_args(en, ms, 4, 1); if (g_enc != en) return;
     enc_r_vbuf(en, DMSH_MESH_FIRST_SLOT, first_gpu);
     if (g_mtk.ind) [en drawMeshThreadgroupsWithIndirectBuffer:g_mtk.ind threadsPerObjectThreadgroup:MTLSizeMake(ts ? ts->mesh_threads : 1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(ms->mesh_threads, 1, 1)];
     else [en drawMeshThreadgroups:MTLSizeMake(g_mtk.count, 1, 1) threadsPerObjectThreadgroup:MTLSizeMake(ts ? ts->mesh_threads : 1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(ms->mesh_threads, 1, 1)];
@@ -611,7 +617,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
     if (!ms || ms->mesh_kind != 2 || !ms->fn || (ts ? !ts->fn : !ms->mesh_notask)) {
         RED_ONCE(150, "DrawMeshTasks without its task and mesh shaders (task %s mesh %s): draw skipped", ts ? ts->key : "-", ms ? ms->key : "-"); return; }
     image_prepare(pr, 1u << 3 | 1u << 4);
-    if (g_nubd && (g_enc || ubd_lazy()) && ((ts && ubd_conflict_sh(ts, 3)) || ubd_conflict_sh(ms, 4))) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // as draw_ does for its stages
+    if (g_nubd && (g_enc || ubd_lazy()) && ((ts && ubd_conflict_sh(ts, 3)) || ubd_conflict_sh(ms, 4) || (dw->ind && ubd_hits(dw->ind, dw->ind + 8)))) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // as draw_ does for its stages
     NvProg *raster = pr->geo_lean_raster;   // the pixel stage alone
     if (!raster || raster->sh[1] != pr->sh[1] || raster->sh[0]) { raster = [NvProg new]; raster->sh[1] = pr->sh[1]; pr->geo_lean_raster = raster; }
     uint64_t ind = 0, ind_first = 0;
@@ -626,7 +632,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
     draw_(&triangle, NULL);
     g_geo_program = nil; g_mtk.on = 0; args_dirty_all();
     if (g_mtk.miss) { g_mtk_wait++; return; }
-    swrite_note(pr); g_wr_epoch++;
+    swrite_note(pr); if (prog_swrites(pr)) g_wr_epoch++;
     if (!g_mtk_n++) MLOG("task / mesh: first draw, task %s mesh %s fragment %s, %u workgroups from %u%s", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", g_mtk.count, g_mtk.first, ind ? " (indirect)" : "");
 }
 static uint64_t g_geo_mesh_n, g_geo_mesh_wait;   // mesh draws; draws the compute path drew while their mesh pipeline was built

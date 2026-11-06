@@ -83,6 +83,10 @@ static void finalized_upload(int write_after_record) {
     h_nvnTextureFinalize(&tex);
     CHECK(mtl_cpu_tex_count() == 0, "finalized texture leaves the live CPU set");
     CHECK(!g_treg[1].view && !g_treg[2].view && !g_treg[2].alt, "finalization retires every descriptor's cached views");
+    {   __unsafe_unretained id<MTLBuffer> pb = nil;
+        mtl_sub_begin(); pool_gpu(0, MTLTextureType2D, 0, 0, &pb);
+        CHECK(!g_treg[1].view && !tex_get(serial), "pool table walk does not re-upload an unbound retired packaged texture");
+        CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "pool table submission completed"); }
     // Reuse the API object: commands and registered descriptors must use their snapshots.
     memset(&tex, 0xa5, sizeof tex);
     state_reset(); memset(&R,0,sizeof R); mtl_sub_begin(); mtl_exec((const uint8_t *)handle);
