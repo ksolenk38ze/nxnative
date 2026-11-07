@@ -430,7 +430,7 @@ static void ft_add(const tex_t *t) {
     // background never appeared). A CPU_NO_ACCESS pool keeps the exclusion: there the compression tags may really be there.
     // A sparse pool's addresses are no memory the CPU writes or flushes, and no range nvn_dirty tracks, so they read as dirty at once: every texture in one, a render target too, came out CPU-written at its first
     // use in a profile with tex_dirty_upload. What the CPU wrote into the physical pages behind one is seen through the page table instead (tex_from_storage, sparse_look)
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !t->mem || !t->pool || t->pool->vp || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
+    if (!DM_GAME_TEX_FLUSH_UPLOAD || !t->mem || !t->pool || t->pool->vp || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) ||
         (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) return;
     flush_tex f = {t->mem, t->L.size, *t, nvn_dirty_now(), NULL, {0, 0}, 0};
     if (DM_GAME_TEX_DIRTY_UPLOAD) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
@@ -823,8 +823,17 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
 NVN(nvnSyncInitialize, NVNboolean, NVNsync *s, NVNdevice *d) { (void)d; *(sync_t *)s = (sync_t){MAGIC('S', 'Y', 'N', 'C'), 0, 0}; return 1; }
 NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
 NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
-// Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
-NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); }
+// Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit (or bind to a parked queue until it drains)
+static void nvn_drain_parked(int force_flush);
+static void nvn_drain_parked_locked(int force_flush);
+NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) {
+    (void)c; (void)f;
+    dm_host_mutex_lock(&g_sub_mu);
+    if (mtl_any_parked_ready()) nvn_drain_parked_locked(0);
+    ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence();
+    if (q) mtl_queue_fence_sync(((const queue_t *)q)->serial, &((sync_t *)s)->fence);
+    pthread_mutex_unlock(&g_sub_mu);
+}
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
 // A GPU-side wait on a sync: the host has a single Metal queue that executes submissions in order, so commands before the fence are always done first and nothing needs waiting. A sync not fenced yet (fenced later by another thread) is not waited for here; logged once
 NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; static int once; if (!((const sync_t *)s)->fenced && !once++) LOG("[nvn] QueueWaitSync: the sync object has no fence yet, the host does not wait"); return 1; }
@@ -838,6 +847,20 @@ static _Atomic uint64_t g_sync_ns;
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    if (*(volatile const uint64_t *)&o->fence == UINT64_MAX) {
+        uint64_t wait_t0 = now_ns(), grace = timeout < 50000000ull ? timeout : 50000000ull;
+        for (;;) {
+            if (*(volatile const uint64_t *)&o->fence == UINT64_MAX && mtl_any_parked_ready())
+                nvn_drain_parked(0);
+            if (*(volatile const uint64_t *)&o->fence != UINT64_MAX || timeout == 0) break;
+            if (now_ns() - wait_t0 >= grace) {
+                if (*(volatile const uint64_t *)&o->fence == UINT64_MAX) nvn_drain_parked(1);
+                break;
+            }
+            usleep(50);
+        }
+    }
+    if (*(volatile const uint64_t *)&o->fence == UINT64_MAX) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
     if (w(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
     uint64_t t0 = now_ns(); int ok = w(o->fence, timeout); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
@@ -855,7 +878,12 @@ NVN_NOPROTO(nvnEventGetMemoryPool, NVNmemoryPool *, const NVNevent *e) { return 
 NVN_NOPROTO(nvnEventGetMemoryOffset, int64_t, const NVNevent *e) { return ((const ev_t *)e)->off; }
 NVN(nvnEventFinalize, void, NVNevent *e) { ((ev_t *)e)->magic = 0; }
 NVN(nvnEventGetValue, uint32_t, const NVNevent *e) { return *((const ev_t *)e)->val; }
-static void ev_signal(const ev_t *e, int mode, uint32_t v) { if (mode == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += v; else *e->val = v; }
+static void ev_signal(const ev_t *e, int mode, uint32_t v) {
+    dm_host_mutex_lock(&g_sub_mu);
+    mtl_cpu_event_signal(e->val, (uint32_t)mode, v);
+    if (mtl_any_parked_ready()) nvn_drain_parked_locked(0);
+    pthread_mutex_unlock(&g_sub_mu);
+}
 NVN(nvnEventSignal, void, NVNevent *e, NVNeventSignalMode m, uint32_t v) { ev_signal((const ev_t *)e, m, v); }
 
 // ---------- Queue ----------
@@ -891,8 +919,8 @@ NVN(nvnQueueFinalize, void, NVNqueue *q) {
 NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *info) {
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
-NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
-NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; mtl_finish(); }
+NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; if (mtl_any_parked_ready()) nvn_drain_parked(0); }
+NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; pthread_mutex_lock(&g_sub_mu); mtl_flush_parked(); pthread_mutex_unlock(&g_sub_mu); mtl_finish(); }
 
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
 #define CB(c) ((cmd_t *)(c))
@@ -1044,7 +1072,12 @@ NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcom
 NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *c, const NVNevent *e, NVNeventSignalMode m, NVNeventSignalLocation loc, int flags, uint32_t v) {
     (void)loc; (void)flags;
     uint8_t *p = cmd_alloc(CB(c), 24); put_hdr(p, OP_SIGNAL_EVENT, 24);
-    const ev_t *ev = (const ev_t *)e; volatile uint32_t *val = ev->val; uint32_t mm = m;
+    const ev_t *ev = (const ev_t *)e; volatile uint32_t *val = ev->val; uint32_t mm = (uint32_t)m & 1u;
+    memcpy(p + 8, &val, 8); memcpy(p + 16, &mm, 4); memcpy(p + 20, &v, 4);
+}
+NVN(nvnCommandBufferWaitEvent, void, NVNcommandBuffer *c, const NVNevent *e, NVNeventWaitMode m, uint32_t v) {
+    uint8_t *p = cmd_alloc(CB(c), 24); put_hdr(p, OP_SIGNAL_EVENT, 24);
+    const ev_t *ev = (const ev_t *)e; volatile uint32_t *val = ev->val; uint32_t mm = 2u | ((uint32_t)m & 1u);
     memcpy(p + 8, &val, 8); memcpy(p + 16, &mm, 4); memcpy(p + 20, &v, 4);
 }
 // A fence recorded in a command buffer: the replay fences the sync with the submission that reaches this point (OP_FENCE_SYNC). Unreal Engine's NVN RHI fences its command buffers this way (Octopath Traveler 0); Pokémon Legends: Z-A fences once a frame this way and waits on it
@@ -1408,21 +1441,65 @@ void dm_gfx_suspend(int on) {
 // The first submission's prepare step (mtl_prepare: the prewarm and the pipeline prebuild) loads shaders and builds pipelines and submits no GPU work, so it runs under the lock but outside the
 // graphics gate: inside it, going to the background meanwhile (dm_gfx_suspend, on the main thread) waited for it, minutes on a first start. It stays host work for the guest scheduler. The lock
 // comes before the gate: a second submission waiting for it must not count as in flight, or the suspend waits for it while the first waits to enter the closed gate holding the lock
+static void nvn_drain_parked_locked(int force_flush) {
+    if (!force_flush && !mtl_any_parked_ready()) return;
+    dm_host_work++; mtl_prepare(); dm_host_work--;
+    gfx_enter();
+    uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
+    if (force_flush) {
+        mtl_flush_parked();
+    } else {
+        mtl_sub_begin();
+        nvn_ft_poll();
+        mtl_try_unpark();
+        mtl_sub_commit();
+    }
+    uint64_t dw = now_ns() - t0;
+    atomic_fetch_add(&g_nvn_ns, dw); atomic_fetch_add(&g_sub_wall_ns, dw);
+    uint64_t i1, y1; thr_counts(&i1, &y1); uint64_t dc = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0, di = i1 - i0;
+    atomic_fetch_add(&g_cum_sub_cyc, y1 - y0); atomic_fetch_add(&g_cum_sub_sys_ns, thr_sys_ns() - s0); atomic_fetch_add(&g_cum_sub_wall_ns, dw);
+    atomic_fetch_add(&g_sub_cpu_ns, dc); atomic_fetch_add(&g_cum_sub_cpu_ns, dc);
+    atomic_fetch_add(&g_sub_instr, di); atomic_fetch_add(&g_cum_sub_instr, di);
+    gfx_leave();
+}
+static void nvn_drain_parked(int force_flush) {
+    if (!force_flush && !mtl_any_parked_ready()) return;
+    dm_host_mutex_lock(&g_sub_mu);
+    nvn_drain_parked_locked(force_flush);
+    pthread_mutex_unlock(&g_sub_mu);
+}
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     dm_host_mutex_lock(&g_sub_mu);
     dm_host_work++; mtl_prepare(); dm_host_work--;
     gfx_enter();
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
     ((queue_t *)q)->submits++;
-    mtl_queue_activate(((const queue_t *)q)->serial);
-    mtl_set_queue_origin_lower_left(((const queue_t *)q)->origin_ll);
+    uint64_t qser = ((const queue_t *)q)->serial;
+    int orig_ll = ((const queue_t *)q)->origin_ll;
     nvn_cap_submit(n, (const uint64_t *)h);   // DM_NVN_CAPTURE (nvn_capture.inc)
-    mtl_sub_begin();
-    nvn_ft_poll();
-    mtl_sub_index((const uint64_t *)h, n);
-    for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }
-    mtl_exec_rest(NULL, 0);
-    mtl_sub_commit();
+    if (mtl_queue_append_if_parked(qser, orig_ll, (const uint64_t *)h, n)) {
+        if (mtl_any_parked_ready()) {
+            mtl_sub_begin();
+            nvn_ft_poll();
+            mtl_try_unpark();
+            mtl_sub_commit();
+        }
+    } else {
+        mtl_queue_activate(qser);
+        mtl_set_queue_origin_lower_left(orig_ll);
+        mtl_sub_begin();
+        nvn_ft_poll();
+        if (mtl_any_parked_ready()) mtl_try_unpark();
+        mtl_sub_index((const uint64_t *)h, n);
+        for (int i = 0; i < n; i++) {
+            mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1);
+            mtl_exec((const uint8_t *)h[i]);
+            if (mtl_queue_is_parked(qser)) break;
+        }
+        mtl_exec_rest(NULL, 0);
+        if (mtl_any_parked_ready()) mtl_try_unpark();
+        mtl_sub_commit();
+    }
     pthread_mutex_unlock(&g_sub_mu);
     uint64_t dw = now_ns() - t0;
     atomic_fetch_add(&g_nvn_ns, dw); atomic_fetch_add(&g_sub_wall_ns, dw);
@@ -1448,7 +1525,6 @@ static const char *const g_nops[] = {
     "nvnCommandBufferPushDebugGroupStatic",
     "nvnCommandBufferPopDebugGroupId",
     "nvnCommandBufferInsertDebugMarkerStatic",
-    "nvnCommandBufferWaitEvent",
     "nvnWindowFinalize",
 };
 __attribute__((constructor)) static void nvn_nops_register(void) {
@@ -1741,8 +1817,8 @@ static void tsummary(uint64_t frame) {
             LOG("[nvn] thread policy: main thread real-time computation %.2f ms / period %.2f ms, real-time policy %s, current priority %d (base %d, policy %d); %u worker threads QoS %#x; present QoS %#x", g_rt_comp_ms, g_rt_period_ms, rt_live ? "in effect" : "not in effect", okx ? xi.pth_curpri : -1, okx ? xi.pth_priority : -1, okx ? xi.pth_policy : -1, wn, wq, mtl_present_qos()); }
         py = cy; pk = ck; pw = cw; }
       pi = ci; pc = cc; pd = dr_; pf = frame; }
-    uint64_t up, re, es = mtl_pkg_edge_skips(), fa, pr; mtl_pkg_stats(&up, &re); nvn_dirty_stats(&fa, &pr);
-    LOG("[nvn] packaged textures: first uploads %llu, re-uploads on pool content change %llu, writes beside a texture only (not re-uploaded) %llu; write-protection faults %llu, pages unprotected before host writes %llu; missed %llu (cumulative); CPU-written textures alive %u", up, re, es, fa, pr, mtl_pkg_miss(), mtl_cpu_tex_count());
+    uint64_t up, re, es = mtl_pkg_edge_skips(), ca = mtl_pkg_copy_absorbs(), fa, pr; mtl_pkg_stats(&up, &re); nvn_dirty_stats(&fa, &pr);
+    LOG("[nvn] packaged textures: first uploads %llu, re-uploads on pool content change %llu, writes beside a texture only (not re-uploaded) %llu, GPU copies into one written into its storage too (not re-uploaded) %llu; write-protection faults %llu, pages unprotected before host writes %llu; missed %llu (cumulative); CPU-written textures alive %u", up, re, es, ca, fa, pr, mtl_pkg_miss(), mtl_cpu_tex_count());
     memset(g_tn, 0, sizeof g_tn);
 }
 // DM_SLOWFRAME=1 (test switch, read over the log port on a real device): per-frame timings are first stored in a ring of the last 16 frames; dropped frames are judged 8 frames late (GPU / on-screen present times are back by then),
@@ -2108,6 +2184,11 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         int lag = 0; for (int i = 0; i < lag_k; i++) if (o->presents % (uint64_t)lag_n[i] < (uint64_t)lag_run[i]) lag += lag_ms[i];
         if (lag) usleep((useconds_t)lag * 1000);
     }
+    dm_host_mutex_lock(&g_sub_mu);
+    if (mtl_any_parked_ready())
+        nvn_drain_parked_locked(0);
+    if (q && mtl_queue_is_parked(((const queue_t *)q)->serial))
+        nvn_drain_parked_locked(1);
     gfx_enter();
     uint64_t t0 = now_ns();
     if (idx >= 0 && idx < o->ntex && idx < 4) {   // enqueue only, return immediately
@@ -2116,6 +2197,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         o->ticket[idx] = mtl_present(t, present_period(o) / 1e9, crop);
     }
     gfx_leave();
+    pthread_mutex_unlock(&g_sub_mu);
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
     if (nvn_real[0] || nvn_real[1]) {   // DM_NVN_PROF: record phase = time of all implemented functions except submit; submit phase = QueueSubmitCommands
@@ -2251,21 +2333,21 @@ NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *buf, const NVNbufferBuilder *b) 
 }
 NVN(nvnBufferFinalize, void, NVNbuffer *buf) { ((buf_t *)buf)->magic = 0; }
 NVN(nvnBufferSetDebugLabel, void, NVNbuffer *buf, const char *s) { (void)buf; (void)s; }
-NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buf) { return (NVNbufferAddress)(BF(buf)->pool->mem + BF(buf)->off); }
+NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buf) { const buf_t *b = BF(buf); return b && b->pool && b->pool->mem ? (NVNbufferAddress)(b->pool->mem + b->off) : 0; }
 // A buffer or pool the CPU has no access to (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) maps to NULL, as in NVN, though the host's storage is CPU memory: EA SPORTS FC 27's Frostbite
 // renderer takes a buffer's GPU address as GetAddress + (its data pointer − Map), with a null data pointer for such a buffer (OpcodeCopySubresource), so a real pointer made the
 // copy's destination address 0 (FATAL buffer copy address is in no memory pool)
-NVN(nvnBufferMap, void *, const NVNbuffer *buf) { return BF(buf)->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? NULL : BF(buf)->pool->mem + BF(buf)->off; }
-NVN(nvnBufferGetSize, size_t, const NVNbuffer *buf) { return (size_t)BF(buf)->size; }
-NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *buf) { return (NVNmemoryPool *)BF(buf)->pool; }
-NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *buf) { return (ptrdiff_t)BF(buf)->off; }
+NVN(nvnBufferMap, void *, const NVNbuffer *buf) { const buf_t *b = BF(buf); return !b || !b->pool || !b->pool->mem || (b->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ? NULL : b->pool->mem + b->off; }
+NVN(nvnBufferGetSize, size_t, const NVNbuffer *buf) { const buf_t *b = BF(buf); return b ? (size_t)b->size : 0; }
+NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *buf) { const buf_t *b = BF(buf); return b ? (NVNmemoryPool *)b->pool : NULL; }
+NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *buf) { const buf_t *b = BF(buf); return b ? (ptrdiff_t)b->off : 0; }
 NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *buf, ptrdiff_t off, size_t n) { (void)buf; (void)off; (void)n; }        // unified memory: nothing to flush
 NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *buf, ptrdiff_t off, size_t n) { (void)buf; (void)off; (void)n; }
 
 // Memory pool queries
-NVN(nvnMemoryPoolGetFlags, NVNmemoryPoolFlags, const NVNmemoryPool *p) { return (NVNmemoryPoolFlags)((const pool_t *)p)->flags; }
-NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p) { return ((const pool_t *)p)->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? NULL : ((const pool_t *)p)->mem; }   // NULL without CPU access (nvnBufferMap)
-NVN(nvnMemoryPoolGetSize, size_t, const NVNmemoryPool *p) { return (size_t)((const pool_t *)p)->size; }
+NVN(nvnMemoryPoolGetFlags, NVNmemoryPoolFlags, const NVNmemoryPool *p) { return p ? (NVNmemoryPoolFlags)((const pool_t *)p)->flags : 0; }
+NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p) { return !p || (((const pool_t *)p)->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ? NULL : ((const pool_t *)p)->mem; }   // NULL without CPU access (nvnBufferMap)
+NVN(nvnMemoryPoolGetSize, size_t, const NVNmemoryPool *p) { return p ? (size_t)((const pool_t *)p)->size : 0; }
 NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
 NVN(nvnMemoryPoolSetDebugLabel, void, NVNmemoryPool *p, const char *s) { (void)p; (void)s; }
 // Debug labels: only for NVN debugging tools, unused by the host
@@ -2377,8 +2459,8 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
                                                                    (const void *)v->pool, (uint64_t)r->voff + r->size > v->len ? "beyond the reservation" : "not aligned to the host page", r->phys ? "map" : "unmap", (unsigned long long)r->voff, (unsigned long long)r->size);
         return 1;
     }
-    if (!r->phys) {   // unmap: inaccessible pages again
-        if (mmap((void *)to, r->size, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) == MAP_FAILED) { LOG("[RED] virtual pool unmap %#lx+%#llx failed (errno %d)", (unsigned long)to, (unsigned long long)r->size, errno); return 0; }
+    if (!r->phys) {   // unmap: zero-filled pages so an in-flight zero-copy buffer over the reservation never faults on an async unmap while vpt_set and vrun_set mark the range unmapped
+        if (mmap((void *)to, r->size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) == MAP_FAILED) { LOG("[RED] virtual pool unmap %#lx+%#llx failed (errno %d)", (unsigned long)to, (unsigned long long)r->size, errno); return 0; }
         vrun_set(v, (uint64_t)r->voff, (uint64_t)r->voff + r->size, 0); return 1;
     }
     uintptr_t from = (uintptr_t)ph->mem + (uintptr_t)r->poff;
@@ -3069,10 +3151,15 @@ NVN(nvnTextureWriteTexelsStrided, void, const NVNtexture *t, const NVNtextureVie
 // RHIAsyncReallocateTexture2D: nvnCommandBufferCopyTextureToTexture, a level at a time) and writes the new, finer levels from the CPU; uploaded from the storage, the copied levels held
 // what the pool had there before (another texture's data, zeros), and the Yoshis' felt sampled speckles from the moment a level streamed in. −1 when the copy cannot be mirrored (3D,
 // a format mismatch, a region out of range): the GPU copy alone then stands until the next upload
+int nvn_tex_level_range(const tex_t *t, unsigned level, unsigned layer, uint64_t *lo, uint64_t *hi) {
+    uint64_t a = nvn_tex_level_offset(&t->d, level), b = level + 1 < t->d.levels ? nvn_tex_level_offset(&t->d, level + 1) : t->L.layer_size;
+    if (b <= a || b > t->L.layer_size || (uint64_t)layer * t->L.layer_size + b > t->L.size) return -1;
+    *lo = (uint64_t)layer * t->L.layer_size + a; *hi = (uint64_t)layer * t->L.layer_size + b;
+    return 0;
+}
 static int mirror_prepare(const tex_t *t, unsigned level, unsigned layer) {   // unprotect (and mark written) the storage of one level of one layer
-    uint64_t lo = nvn_tex_level_offset(&t->d, level), hi = level + 1 < t->d.levels ? nvn_tex_level_offset(&t->d, level + 1) : t->L.layer_size;
-    if (hi <= lo || hi > t->L.layer_size || (uint64_t)layer * t->L.layer_size + hi > t->L.size) return -1;
-    dm_guest_write_prepare(t->mem + (uint64_t)layer * t->L.layer_size + lo, hi - lo);
+    uint64_t lo, hi; if (nvn_tex_level_range(t, level, layer, &lo, &hi)) return -1;
+    dm_guest_write_prepare(t->mem + lo, hi - lo);
     return 0;
 }
 int nvn_tex_mirror_b2t(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
