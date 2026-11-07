@@ -929,6 +929,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md) and [MIO: Memories in Orbit, issue #941](https://github.com/seedds/nxnative/issues/941). The visibility-buffer shading issue in MIO is still open.
 - **Note:** the replay used to commit its work and wait for the GPU before the first such draw after each GPU write, then read the count on the CPU (`mdi_wait`; still used when a CPU count is needed, including quads, fans and 8-bit indices). In Kamura Village that wait held the submitting thread 14 of its 20 ms a frame on an iPhone (36–54 fps). On the Mac the same scene's submit took 20 ms of wall time for 6.1 ms of work, and now 5.1 ms, all of it work.
 
+### Pre-pass indirect draw conversion and indirect dispatch clamping
+
+- **Symptom:** indirect draws that need vertex or index conversion inside an open render pass split the pass (`rp_end()`), losing tile state, and uninitialized indirect compute dispatch or mesh task records dispatch unbounded threadgroup grids.
+- **Cause:** `draw_()` dispatched compute indirect conversions (`ixc_run`, `mdx_run`) on demand inside the active render pass, and indirect compute dispatches (`DispatchComputeIndirect`) and mesh draws (`DrawMeshTasksIndirect`) passed guest indirect buffers directly to Metal without clamping out-of-range grid dimensions.
+- **Fix:** `ixc_run` and `mdx_run` convert indirect records ahead of the render pass before `rp_begin()`, and `ixc_clamp` / `mdx_clamp` clamp indirect dispatch and mesh grid counts on the GPU (`DM_NVN_IND_CLAMP=0` disables clamping).
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (`0400486024DEC000`, `v131072`).
+
 ### CPU reads after a drain wait only for later writes
 
 - **Symptom:** a hitch of a second or more as a level opens: a few frames of 330–540 ms whose submission takes 2–3 times its CPU time, and the wait ledger (`DM_NVN_WAITS=1`) shows thousands of indirect-count multi-draw waits for those frames only.
@@ -1022,6 +1029,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** `ubo_read` in `nvn_mtl.m`, for every game. A pool's buffer wraps guest memory without a copy at its own address (`mtl_pool_add` is the only place pools are made), so once `mtl_addr` finds the pool, the bytes are read at the guest address itself; `mtl_addr` still runs, so the pool check and its residency are unchanged. An arena keeps its buffer's `contents` (`NvArena.cpu`), and the argument, push-constant, driver-segment and border writes go through it. If pools ever stop being no-copy wrappers, this read would need the buffer again.
 - **Check:** `make -C dm/gfx/tests GAME=<id> run`. Fortune's Weave's battle map (MacBook Pro M1 Pro): submit 42.8k → 39.2k instructions per draw.
 - **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md).
+
+### Contiguous gmem pool run merging and pulling-base archive retention
+
+- **Symptom:** games with many adjacent NVN memory pools spend extra cycles binary-searching the raw `gmem` pool table or overflow its 512-entry limit, and vertex-pulling pipelines (`pull=1`) recompile on startup even when prewarmed into a `.mtl4a` archive.
+- **Cause:** `pool_gpu_raw` emitted one `gmem` entry per NVN pool even when adjacent pools were contiguous in both guest and Metal GPU virtual space, and `arch_save_base` did not retain the unspecialized pulling base descriptor alongside the derived state.
+- **Fix:** `pool_gpu_raw` merges contiguous `(lo, hi)` pool runs whose Metal `gpuAddress` spans are equally contiguous, and `pso4` retains pulling base descriptors in `.mtl4a` archives with a fallback when an archive entry cannot be materialized (`DM_NVN_PSO_PULL_BASE=0` disables pulling-base archive retention).
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (`0400486024DEC000`, `v131072`).
 
 ### Depth plane copies between depth formats
 
@@ -1217,6 +1231,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Cause:** the depth downsample copy left the stencil as the destination's previous content (at the time, new depth-stencil textures were not zero-filled either).
 - **Fix:** the copy now carries the stencil.
 - **Found on:** [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md): the occlusion pass (`aa05724ffa62cb82`, a 480×270 R8 target cleared to 1.0) only writes where stencil bit 1 of the quarter-size depth-stencil copy is clear, so on the Mac the mask kept 1.0 everywhere.
+
+### Cross-queue NVNevent waits and per-queue command parking
+
+- **Symptom:** dynamic skinned meshes or objects updated on a secondary compute/transfer `NVNqueue` flicker or draw with stale vertices when synchronized with the main graphics queue through `nvnCommandBufferWaitEvent` and `nvnCommandBufferSignalEvent`.
+- **Cause:** `nvnCommandBufferWaitEvent` was a no-op stub, and `SubmitCommands` drained a secondary queue immediately on the calling thread instead of parking its submissions until the signaled `NVNevent` value was reached.
+- **Fix:** `nvnCommandBufferWaitEvent` and `nvnCommandBufferSignalEvent` record `P_WAIT_EVENT` and `P_SIGNAL_EVENT` commands; `q_submit_or_park` parks secondary-queue command handles behind unsatisfied event waits and `q_drain_parked` drains them once the matching `SignalEvent` or CPU write completes.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (`0400486024DEC000`, `v131072`).
 
 ### Periodic GPU profiles close at frame boundaries
 
@@ -1541,9 +1562,25 @@ Digimon Story Cyber Sleuth: Complete Edition (Media.Vision's MVGL engine, SDK 6.
 
 - **Symptom:** read-only depth/stencil attachments are written back after every pass, and the periodic unwritten-store savings counter remains zero with the default configuration.
 - **Cause:** `udc_note_draw` and `sd_finish` returned early when `DM_NVN_TBDR` was off. This also disabled the local unwritten-attachment proof, although it does not depend on future sampled-texture readers. The broader lookahead remains disabled because it does not understand bindless readers.
-- **Fix:** collect per-pass write facts independently of the lookahead switch and omit only stores of attachments that were loaded and provably unchanged. Clears, depth writes, stencil writes and possible writable image/atomic/storage aliases conservatively retain stores, except for the mandatory [image-only color-attachment rule](#image-stores-into-an-attachment-of-their-own-pass). Lookahead, pass merging and cross-submission invalidation remain disabled. `DM_NVN_UNWRITTEN_DC=0` disables optional unwritten-store savings; the image-write preservation rule stays active.
+- **Fix:** collect per-pass write facts independently of the lookahead switch and omit only stores of attachments that were loaded and provably unchanged. Clears, depth writes, stencil writes and possible writable image/atomic/storage aliases conservatively retain stores, except for the mandatory [image-only color-attachment rule](#image-stores-into-an-attachment-of-their-own-pass). Lookahead, pass merging and cross-submission invalidation remain disabled by default ([Store lookahead and bindless readers](#store-lookahead-and-bindless-readers)). `DM_NVN_UNWRITTEN_DC=0` disables optional unwritten-store savings; the image-write preservation rule stays active.
 - **Check:** `make -C dm/gfx/tests GAME=<id> check_t_unwritten_store` performs real GPU readback against a store-all control and literal color/depth/stencil values, with lookahead disabled. It covers read-only depth/stencil, depth writes, stencil writes, pending clears, and writable images (including native image atomics) and both storage-buffer binding forms. `t_unwritten_store --bench` runs a synthetic 32-pass 1080p workload with balanced on/off order; it is not a game FPS measurement.
 - **Found on:** [NieR:Automata US 1.0.3](../../dm/games/010056B015FE8000/README.md#factory-combat-capture-and-9s-texture-follow-up), during iPhone factory-combat performance investigation. The change passes the GPU proof and rendering regressions on Mac; iPhone gameplay benefit remains to be measured.
+
+### Store lookahead and bindless readers
+
+- **Symptom:** with `DM_NVN_TBDR=1`, an attachment that only a later bindless draw samples could lose its store at the end of its pass (the picture then reads stale or undefined texels); the reason the lookahead is off by default ([Bindless textures](../agents/04-graphics.md#4-bindless-textures)).
+- **Cause:** the submission index (`sdx_walk`) noted a draw's texture reads only from its bound slots (`NVN_RB_TEX`, `TBUF`, `IMG`). A handle read from a uniform buffer (`NVN_RB_TEXU`), an array of handles (`TEXA` / `TEXD`), or a shader the reflection calls bindless or dynamic gave no read event, so `sdx_decide` could find the attachment's next full clear first and drop the store.
+- **Fix:** such a draw (and one with no program) is noted as needing every candidate texture known at that point (`SDX_NEED`): the store is kept, the ledger counts it as a read, and no pass merge starts on it (the merge pre-screen looks for `SDX_READ`). Slot reads and the rest of the decision are unchanged; the lookahead stays off by default until game runs measure it.
+- **Check:** `make -C dm/gfx/tests GAME=<id> check_t_lookahead_bindless` indexes a three-pass submission with the production `mtl_sub_index` and asks `sdx_decide` at the end of the first pass: 5 of its 22 checks fail without the change (TEXU, TEXA, TEXD, bindless and dynamic reflection), none with it; a draw with no texture read or a slot read of another texture still drops the store.
+- **Found on:** no game: from the code, while looking at why the TBDR optimizations are off ([#159](https://github.com/seedds/nxnative/issues/159)).
+
+### Retired texture descriptors evicting live alias textures
+
+- **Symptom:** steady GPU memory growth (`newTextureWithDescriptor` at `nvn_mtl.m` creating tens of GB of textures across a few minutes), transparent ground patches or missing wall fixtures where retired descriptors or evicted `NvPkg` records resolve to dummy textures, or severe frame-rate drops when retired bindless views are dropped every submission.
+- **Cause:** during a bindless pool walk (`pool_gpu`), resolving a retired descriptor whose storage had been taken over by a live alias allocated a zeroed `MTLTexture` and evicted the live alias in `g_alias`; conversely, dropping `NvPkg` records from `g_by_serial` on `nvnTextureFinalize` without keeping them in `g_ghost` expired weak `g_pkg_share` entries for textures still referenced by registered IDs, and dropping cached `rp->view` on all ~5,766 retired descriptors at `treg_finish_submission` forced thousands of `MTLTextureView` recreations per frame.
+- **Fix:** `tex_mtl_` refuses to recreate a retired descriptor (`treg_retired`) when a live alias overlaps its `(pool, off)` range, `mtl_tex_release` keeps finalized `NvPkg` records in `g_ghost` (`NGHOST = 32768`) so shared packages remain alive while descriptors are registered, `pool_entry` resolves already-made retired descriptors, and `rp->view` stays cached across submissions when `g_ntreg > 2048`.
+- **Check:** `make -C dm/gfx/tests GAME=0400486024DEC000 check_t_upgrade_alias` verifies that `tex_by_id` on a retired descriptor overlapping a live alias returns `nil` without allocating a new `MTLTexture`, keeps the live texture in `g_alias`, and marks the retired slot `gone`.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (`0400486024DEC000`, `v131072`).
 
 ### iOS layouts: portrait, a half-folded Duo, iPad windows
 
